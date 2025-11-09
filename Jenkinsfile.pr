@@ -1,0 +1,94 @@
+pipeline {
+  agent any
+  options { skipDefaultCheckout(false) }
+
+  // Prefer Multibranch Pipeline with GitHub source for PR discovery
+
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Setup Tools') {
+      steps {
+        sh '''
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install -U pip
+          # TODO: Ensure tools are available (bandit, safety, detect-secrets, jq, trivy if using fs scan)
+          pip install bandit safety detect-secrets
+        '''
+      }
+    }
+
+    stage('SAST: Bandit') {
+      steps {
+        sh '''
+          . .venv/bin/activate
+          bandit -r app -f json -o bandit-report.json || true
+        '''
+      }
+    }
+
+    stage('OSS: Safety') {
+      steps {
+        sh '''
+          . .venv/bin/activate
+          safety check --full-report --json > safety-report.json || true
+        '''
+      }
+    }
+
+    stage('Secrets: detect-secrets') {
+      steps {
+        sh '''
+          . .venv/bin/activate
+          # Baseline should be committed and reviewed
+          detect-secrets scan --baseline .secrets.baseline --all-files > detect-secrets.json || true
+        '''
+      }
+    }
+
+    stage('Optional: Trivy Filesystem Scan') {
+      steps {
+        sh '''
+          # Requires trivy installed or dockerized usage
+          trivy fs --severity CRITICAL,HIGH --format json --output trivy-fs.json . || true
+        '''
+      }
+    }
+
+    stage('Quality Gate') {
+      steps {
+        sh '''
+          # TODO: Implement robust counting with jq for your report schemas
+          SAST=$(jq '.results | length' bandit-report.json 2>/dev/null || echo 0)
+          OSS=$(jq 'length' safety-report.json 2>/dev/null || echo 0)
+          FS=$(jq '[.Results[].Vulnerabilities // []] | flatten | length' trivy-fs.json 2>/dev/null || echo 0)
+
+          # Secrets: fail if any finding present (simple heuristic)
+          SECRETS=0
+          if grep -q '"type":' detect-secrets.json 2>/dev/null; then SECRETS=1; fi
+
+          echo "SAST=$SAST OSS=$OSS TRIVY_FS=$FS SECRETS=$SECRETS"
+
+          TOTAL=$((SAST + OSS + FS))
+          if [ "$SECRETS" -gt 0 ]; then
+            echo "Secrets detected. Failing PR check."; exit 1
+          fi
+          if [ "$TOTAL" -ge 10 ]; then
+            echo "Too many High/Critical findings ($TOTAL >= 10). Failing PR check."; exit 1
+          fi
+        '''
+      }
+    }
+  }
+
+  post {
+    always {
+      archiveArtifacts artifacts: '*.json', fingerprint: true
+    }
+  }
+}

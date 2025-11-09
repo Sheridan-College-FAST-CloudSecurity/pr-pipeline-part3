@@ -1,0 +1,13 @@
+.git
+.gitignore
+README.md
+Dockerfile
+.dockerignore
+Jenkinsfile
+scripts/
+docs/
+jenkins-config/
+aws-config/
+security-scans/
+*.log
+.env

@@ -1,0 +1,113 @@
+pipeline {
+  agent any
+  options { skipDefaultCheckout(false) }
+
+  environment {
+    IMAGE_NAME = "flask-app"
+    IMAGE_TAG  = "${env.GIT_COMMIT}"
+    AWS_REGION = "us-east-1"  // TODO: set your AWS region
+    ECR_REPO   = "123456789012.dkr.ecr.${AWS_REGION}.amazonaws.com/flask-app"  // TODO: replace with your ECR repo
+  }
+
+  stages {
+    stage('Verify main branch trigger') {
+      when { not { branch 'main' } }
+      steps {
+        error("This pipeline must run only for the main branch.")
+      }
+    }
+
+    stage('Checkout') {
+      when { branch 'main' }
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Setup Tools') {
+      steps {
+        sh '''
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install -U pip
+          pip install bandit safety detect-secrets
+          # TODO: Ensure trivy and jq are installed or pre-baked into the agent
+        '''
+      }
+    }
+
+    stage('Build Container') {
+      steps {
+        sh 'docker build -t $IMAGE_NAME:$IMAGE_TAG .'
+      }
+    }
+
+    stage('SAST, OSS, and Secrets Scans') {
+      steps {
+        sh '''
+          . .venv/bin/activate
+          bandit -r app -f json -o bandit-report.json || true
+          safety check --full-report --json > safety-report.json || true
+          detect-secrets scan --baseline .secrets.baseline --all-files > detect-secrets.json || true
+        '''
+      }
+    }
+
+    stage('Trivy Image Scan') {
+      steps {
+        sh '''
+          trivy image --severity CRITICAL,HIGH --format json --output trivy-image.json $IMAGE_NAME:$IMAGE_TAG || true
+        '''
+      }
+    }
+
+    stage('Quality Gate') {
+      steps {
+        sh '''
+          SAST=$(jq '.results | length' bandit-report.json 2>/dev/null || echo 0)
+          OSS=$(jq 'length' safety-report.json 2>/dev/null || echo 0)
+          IMG=$(jq '[.Results[].Vulnerabilities // []] | flatten | length' trivy-image.json 2>/dev/null || echo 0)
+          SECRETS=0
+          if grep -q '"type":' detect-secrets.json 2>/dev/null; then SECRETS=1; fi
+
+          echo "SAST=$SAST OSS=$OSS TRIVY_IMAGE=$IMG SECRETS=$SECRETS"
+          TOTAL=$((SAST + OSS + IMG))
+
+          if [ "$SECRETS" -gt 0 ]; then
+            echo "Secrets detected. Failing pipeline."; exit 1
+          fi
+          if [ "$TOTAL" -ge 10 ]; then
+            echo "Too many High/Critical findings ($TOTAL >= 10). Failing pipeline."; exit 1
+          fi
+        '''
+      }
+    }
+
+    stage('Manual Approval before ECR Push') {
+      steps {
+        script {
+          input message: 'Security gates passed. Approve push to ECR?', ok: 'Approve'
+        }
+      }
+    }
+
+    stage('Login & Push to ECR') {
+      steps {
+        withAWS(region: "${AWS_REGION}", credentials: 'aws-creds-id') { // TODO: configure Jenkins credential ID
+          sh '''
+            aws ecr get-login-password --region ${AWS_REGION} \
+              | docker login --username AWS --password-stdin ${ECR_REPO%/*}
+            docker tag $IMAGE_NAME:$IMAGE_TAG $ECR_REPO:$IMAGE_TAG
+            docker push $ECR_REPO:$IMAGE_TAG
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      archiveArtifacts artifacts: '*.json', fingerprint: true
+    }
+  }
+}
